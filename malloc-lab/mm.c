@@ -157,6 +157,15 @@ void *mm_malloc(size_t size)
  */
 void mm_free(void *ptr)
 {
+    size_t size = GET_SIZE(HDRP(ptr)); // 블록 전체 크기 파악
+
+    /* 블록 크기는 그대로 둔 채로 할당 비트만 0으로 바꾼 새로운 4바이트 값을 헤더와 푸터에 덮어씌움 
+    => 이 블록은 이제 할당 상태가 아니라 가용 상태라는 걸 명시해두는 것 */
+    PUT(HDRP(ptr), PACK(size, 0));
+    PUT(FTRP(ptr), PACK(size, 0));
+    coalesce(ptr); // 인접 블록들을 확인해서 합칠 수 있으면 합침
+}
+
 }
 
 /*
