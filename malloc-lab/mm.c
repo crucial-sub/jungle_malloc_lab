@@ -141,15 +141,34 @@ static void *extend_heap(size_t words)
  */
 void *mm_malloc(size_t size)
 {
-    int newsize = ALIGN(size + SIZE_T_SIZE);
-    void *p = mem_sbrk(newsize);
-    if (p == (void *)-1)
+    size_t asize;           /* 실제 할당할 조정된 블록 크기 */
+    size_t extendsize;      /* 공간이 없을 때 힙을 확장할 크기 */
+    char *bp;
+
+    if (size == 0)
         return NULL;
+
+    /* 실제 필요한 블록 크기 계산 */
+    /* 요청한 size가 8바이트보다 작으면 최소치로 16바이트를 요청 
+       8바이트는 정렬 요건을 만족시키기 위해, 추가적인 8바이트는 헤더와 풋터 오버헤드를 위해
+       일반적으로는 오버헤드 바이트(8)를 추가하고 인접 8의 배수로 반올림 */
+    if (size <= DSIZE)
+        asize = 2*DSIZE;
     else
-    {
-        *(size_t *)p = size;
-        return (void *)((char *)p + SIZE_T_SIZE);
+        asize = DSIZE * ((size + (DSIZE) + (DSIZE-1)) / DSIZE);
+
+    /* Plan A: 가용 리스트에서 적절한 블록 탐색 */
+    if ((bp = find_fit(asize)) != NULL) {
+        place(bp, asize);
+        return bp;
     }
+
+    /* Plan B: 적절한 블록이 없으면 힙을 확장하여 새 공간 확보 */
+    extendsize = MAX(asize, CHUNKSIZE);
+    if ((bp = extend_heap(extendsize/WSIZE)) == NULL)
+        return NULL;
+    place(bp, asize);
+    return bp;
 }
 
 /*
@@ -205,6 +224,36 @@ static void *coalesce(void *bp)
     return bp; // 최종적으로 합쳐진 블록의 시작 포인터를 반환
 }
 
+// First-fit
+static void *find_fit(size_t asize)
+{
+    void *bp;
+    for(bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
+        if (!GET_ALLOC(HDRP(bp)) && GET_SIZE(HDRP(bp)) >= asize) {
+            return bp;
+        }
+    }
+    return NULL;
+}
+
+static void place(void *bp, size_t asize)
+{
+    // 내가 찾은 가용 블록의 전체 크기를 확인
+    size_t csize = GET_SIZE(HDRP(bp));
+
+    // 남는 공간이 최소 블록 크기(32비트 기준 16바이트)보다 크거나 같은가?
+    if (csize - asize >= (2*DSIZE)) {
+        PUT(HDRP(bp), PACK(asize, 1));
+        PUT(FTRP(bp), PACK(asize, 1));
+
+        PUT(HDRP(NEXT_BLKP(bp)), PACK(csize - asize, 0));
+        PUT(FTRP(NEXT_BLKP(bp)), PACK(csize - asize, 0));
+    }
+    // 남는 공간이 별로 없다면, 그냥 통째로 다 쓴다.
+    else {
+        PUT(HDRP(bp), PACK(csize, 1));
+        PUT(FTRP(bp), PACK(csize, 1));
+    }
 }
 
 /*
