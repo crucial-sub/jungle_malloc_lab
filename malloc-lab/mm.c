@@ -112,6 +112,30 @@ int mm_init(void)
 }
 
 /*
+ * 요청받은 만큼 메모리를 추가로 확보한다.
+ * 새로 얻은 공간을 하나의 커다란 '가용 블록(free block)'으로 만든다.
+ * 새 블록 바로 앞 블록이 가용 상태였다면, 두 블록을 합쳐서 더 큰 가용 블록으로 만든다.
+ */
+static void *extend_heap(size_t words)
+{
+    char *bp;
+    size_t size;
+
+    /* 더블 워드 정렬(8바이트)을 유지하면서 바이트 크기로 변환 (요청받은 워드의 개수가 홀수이면 1을 더한 뒤 변환) */
+    size = (words % 2) ? (words+1) * WSIZE : words * WSIZE;
+    if ((long)(bp = mem_sbrk(size)) == -1)
+        return NULL;
+
+    /* 새로 확장된 힙 공간을 가용 블록으로 초기화하고, 새 에필로그 헤더를 설정 */
+    PUT(HDRP(bp), PACK(size, 0));                   /* 새 가용 블록의 헤더를 설정("이 블록의 크기는 size이며 가용 상태이다") */
+    PUT(FTRP(bp), PACK(size, 0));                   /* 새 가용 블록의 푸터를 설정(헤더와 마찬가지) */
+    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1));           /* 힙의 새로운 끝을 표시하는 새 에필로그 헤더를 설정 */
+
+    /* 만약 이전 블록이 가용 상태였다면 새로 만든 블록과 합치기 위해 coalesce 함수 호출 */
+    return coalesce(bp);
+}
+
+/*
  * mm_malloc - Allocate a block by incrementing the brk pointer.
  *     Always allocate a block whose size is a multiple of the alignment.
  */
