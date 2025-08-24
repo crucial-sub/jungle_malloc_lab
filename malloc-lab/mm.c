@@ -166,6 +166,45 @@ void mm_free(void *ptr)
     coalesce(ptr); // 인접 블록들을 확인해서 합칠 수 있으면 합침
 }
 
+static void *coalesce(void *bp)
+{
+    /* 현재 블록을 기준으로 이전 및 다음 블록의 할당 상태를 확인 */
+    size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
+    size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
+    size_t size = GET_SIZE(HDRP(bp));
+
+    /* Case 1: 이전과 다음 블록이 모두 할당된 상태 */
+    if (prev_alloc && next_alloc) {
+        return bp; // 병합할 블록이 없으므로 그대로 반환
+    }
+
+    /* Case 2: 이전은 할당, 다음은 가용 상태 => 현재 블록과 다음 블록을 병합 */
+    else if (prev_alloc && !next_alloc) {
+        void *next_bp = NEXT_BLKP(bp); // (중요) 헤더를 갱신하기 전에 다음 블록의 포인터를 미리 변수에 저장해둠
+        size += GET_SIZE(HDRP(NEXT_BLKP(bp))); // 다음 블록의 크기를 더해 새로운 전체 크기를 계산
+        PUT(HDRP(bp), PACK(size, 0)); // 현재 블록의 헤더에 새로운 크기를 업데이트
+        PUT(FTRP(next_bp), PACK(size, 0)); // 다음 블록의 푸터에 새로운 크기를 업데이트 (이것이 합쳐진 새 블록의 푸터가 됨)
+    }
+
+    /* Case 3: 이전은 가용, 다음은 할당 상태 => 이전 블록과 현재 블록을 병합 */
+    else if (!prev_alloc && next_alloc) {
+        size += GET_SIZE(HDRP(PREV_BLKP(bp))); // 이전 블록의 크기를 더해 새로운 전체 크기를 계산
+        bp = PREV_BLKP(bp); // bp를 이전 블록의 시작점으로 먼저 옮겨줌 (이전 블록이 합쳐진 새 블록의 시작점이 되므로)
+        PUT(HDRP(bp), PACK(size, 0)); // 이전 블록의 헤더에 새로운 크기를 업데이트
+        PUT(FTRP(bp), PACK(size, 0)); // 푸터에 새로운 크기를 업데이트 (헤더 내 크기 정보가 갱신되어 FTRP 매크로 계산시 현재 블록의 푸터 위치를 반환하게 됨)
+    }
+
+    /* Case 4: 이전과 다음 블록이 모두 가용 상태 */
+    else {
+        void *next_bp = NEXT_BLKP(bp); // 다음 블록 포인터 미리 저장
+        size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(HDRP(NEXT_BLKP(bp)));
+        bp = PREV_BLKP(bp); // bp를 이전 블록의 시작점으로 먼저 옮겨줌
+        PUT(HDRP(bp), PACK(size, 0)); // 이전 블록의 헤더 위치에 새로운 크기를 업데이트
+        PUT(FTRP(next_bp), PACK(size, 0)); // 다음 블록의 푸터 위치에 새로운 크기를 업데이트
+    }
+    return bp; // 최종적으로 합쳐진 블록의 시작 포인터를 반환
+}
+
 }
 
 /*
@@ -180,7 +219,8 @@ void *mm_realloc(void *ptr, size_t size)
     newptr = mm_malloc(size);
     if (newptr == NULL)
         return NULL;
-    copySize = *(size_t *)((char *)oldptr - SIZE_T_SIZE);
+    // 32비트 환경에서는 헤더와 푸터의 크기가 4바이트(WSIZE)이므로, SIZE_T_SIZE 대신 DSIZE를 사용
+    copySize = GET_SIZE(HDRP(oldptr)) - DSIZE; 
     if (size < copySize)
         copySize = size;
     memcpy(newptr, oldptr, copySize);
