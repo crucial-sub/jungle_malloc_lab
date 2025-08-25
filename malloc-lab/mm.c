@@ -81,6 +81,7 @@ static void *extend_heap(size_t words);
 static void *coalesce(void *bp);
 static void *find_fit(size_t asize);
 static void place(void *bp, size_t asize);
+static char *last_bp;
 
 /*
  * mm_init - initialize the malloc package.
@@ -106,8 +107,10 @@ int mm_init(void)
 
     /* 힙을 CHUNKSIZE만큼 확장하여 초기 가용 블록을 생성한다.
      * 이 공간이 있어야 비로소 첫 malloc 요청을 처리할 수 있게 된다. */
-    if (extend_heap(CHUNKSIZE/WSIZE) == NULL)
-        return -1;
+    void *bp = extend_heap(CHUNKSIZE/WSIZE);
+    if (bp == NULL) return -1;
+
+    last_bp = bp;
     return 0;
 }
 
@@ -200,6 +203,9 @@ static void *coalesce(void *bp)
     /* Case 2: 이전은 할당, 다음은 가용 상태 => 현재 블록과 다음 블록을 병합 */
     else if (prev_alloc && !next_alloc) {
         void *next_bp = NEXT_BLKP(bp); // (중요) 헤더를 갱신하기 전에 다음 블록의 포인터를 미리 변수에 저장해둠
+        if (last_bp == next_bp) {
+            last_bp = bp;
+        }
         size += GET_SIZE(HDRP(NEXT_BLKP(bp))); // 다음 블록의 크기를 더해 새로운 전체 크기를 계산
         PUT(HDRP(bp), PACK(size, 0)); // 현재 블록의 헤더에 새로운 크기를 업데이트
         PUT(FTRP(next_bp), PACK(size, 0)); // 다음 블록의 푸터에 새로운 크기를 업데이트 (이것이 합쳐진 새 블록의 푸터가 됨)
@@ -209,6 +215,9 @@ static void *coalesce(void *bp)
     else if (!prev_alloc && next_alloc) {
         size += GET_SIZE(HDRP(PREV_BLKP(bp))); // 이전 블록의 크기를 더해 새로운 전체 크기를 계산
         bp = PREV_BLKP(bp); // bp를 이전 블록의 시작점으로 먼저 옮겨줌 (이전 블록이 합쳐진 새 블록의 시작점이 되므로)
+        if (last_bp == bp) {
+            last_bp = PREV_BLKP(bp);
+        }
         PUT(HDRP(bp), PACK(size, 0)); // 이전 블록의 헤더에 새로운 크기를 업데이트
         PUT(FTRP(bp), PACK(size, 0)); // 푸터에 새로운 크기를 업데이트 (헤더 내 크기 정보가 갱신되어 FTRP 매크로 계산시 현재 블록의 푸터 위치를 반환하게 됨)
     }
@@ -216,6 +225,9 @@ static void *coalesce(void *bp)
     /* Case 4: 이전과 다음 블록이 모두 가용 상태 */
     else {
         void *next_bp = NEXT_BLKP(bp); // 다음 블록 포인터 미리 저장
+        if (last_bp == next_bp || last_bp == bp) {
+            last_bp = PREV_BLKP(bp);
+        }
         size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(HDRP(NEXT_BLKP(bp)));
         bp = PREV_BLKP(bp); // bp를 이전 블록의 시작점으로 먼저 옮겨줌
         PUT(HDRP(bp), PACK(size, 0)); // 이전 블록의 헤더 위치에 새로운 크기를 업데이트
@@ -225,34 +237,63 @@ static void *coalesce(void *bp)
 }
 
 // First-fit
+// static void *find_fit(size_t asize)
+// {
+//     void *bp;
+//     for(bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
+//         if (!GET_ALLOC(HDRP(bp)) && GET_SIZE(HDRP(bp)) >= asize) {
+//             return bp;
+//         }
+//     }
+//     return NULL;
+// }
+
+// Next-fit
 static void *find_fit(size_t asize)
 {
-    void *bp;
-    for(bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
+    char *bp;
+    for(bp = last_bp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
         if (!GET_ALLOC(HDRP(bp)) && GET_SIZE(HDRP(bp)) >= asize) {
+            last_bp = bp;
+            return bp;
+        }
+    }
+    for(bp = NEXT_BLKP(heap_listp); bp != last_bp ; bp = NEXT_BLKP(bp)) {
+        if (!GET_ALLOC(HDRP(bp)) && GET_SIZE(HDRP(bp)) >= asize) {
+            last_bp = bp;
             return bp;
         }
     }
     return NULL;
 }
 
+
 static void place(void *bp, size_t asize)
 {
-    // 내가 찾은 가용 블록의 전체 크기를 확인
-    size_t csize = GET_SIZE(HDRP(bp));
+    size_t csize = GET_SIZE(HDRP(bp)); // 현재 가용 블록의 총 크기
+    size_t rem = csize - asize;        // 남는 크기
 
     // 남는 공간이 최소 블록 크기(32비트 기준 16바이트)보다 크거나 같은가?
-    if (csize - asize >= (2*DSIZE)) {
+    if (rem >= (2*DSIZE)) {
+        // 앞쪽 asize만큼을 할당 표기
         PUT(HDRP(bp), PACK(asize, 1));
         PUT(FTRP(bp), PACK(asize, 1));
 
-        PUT(HDRP(NEXT_BLKP(bp)), PACK(csize - asize, 0));
-        PUT(FTRP(NEXT_BLKP(bp)), PACK(csize - asize, 0));
+        // 뒤쪽 잔여 공간을 새 free 블록으로 만들기
+        void *rbp = NEXT_BLKP(bp); // // bp + asize (헤더가 asize로 갱신되었으니 OK)
+        PUT(HDRP(rbp), PACK(rem, 0));
+        PUT(FTRP(rbp), PACK(rem, 0));
+
+        /* next-fit 사용 시: 다음 탐색 시작점을 잔여 free로 이동 */
+        last_bp = rbp;
     }
     // 남는 공간이 별로 없다면, 그냥 통째로 다 쓴다.
     else {
         PUT(HDRP(bp), PACK(csize, 1));
         PUT(FTRP(bp), PACK(csize, 1));
+
+        /* next-fit 사용 시: 방금 쓴 블록의 다음으로 이동 */
+        last_bp = NEXT_BLKP(bp);
     }
 }
 
