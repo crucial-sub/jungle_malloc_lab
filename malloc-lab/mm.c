@@ -39,8 +39,8 @@ team_t team = {
     ""};
 
 /* Basic constants and macros */
-#define WSIZE sizeof(void *)        /* 64비트 기준 1워드 크기를 8바이트로 정의 => 헤더와 푸터의 크기로 사용 */
-#define DSIZE (2 * WSIZE)           /* 더블 워드의 크기는 16바이트 => 메모리 정렬의 기본 단위로 사용 */
+#define WSIZE 4       /* 64비트 기준 1워드 크기를 8바이트로 정의 => 헤더와 푸터의 크기로 사용 */
+#define DSIZE 8         /* 더블 워드의 크기는 16바이트 => 메모리 정렬의 기본 단위로 사용 */
 #define CHUNKSIZE (1 << 12)         /* 힙 공간이 부족할 때, sbrk를 통해 추가로 요청할 메모리의 기본 크기 (4096바이트) */
 #define NUM_CLASSES 12              /* SEGREGATED: 사이즈 클래스 개수 */
 
@@ -50,11 +50,11 @@ team_t team = {
 #define PACK(size, alloc) ((size) | (alloc))
 
 /* 64비트 환경이므로 size_t (보통 unsigned long)를 사용하여 8바이트 단위로 읽고 씀 */
-#define GET(p) (*(size_t *)(p))
-#define PUT(p, val) (*(size_t *)(p) = (val))
+#define GET(p) (*(int *)(p))
+#define PUT(p, val) (*(int *)(p) = (val))
 
 /* 헤더/푸터의 크기/할당비트 추출 (16바이트 정렬 기준) */
-#define GET_SIZE(p) (GET(p) & ~0xF)
+#define GET_SIZE(p) (GET(p) & ~0x7)
 #define GET_ALLOC(p) (GET(p) & 0x1)
 
 /*
@@ -72,17 +72,21 @@ team_t team = {
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))
 
 /* explicit free list 전용: 가용 블록 payload 앞부분을 pred/succ 포인터 저장용으로 사용 */
+#define PTRSIZE    (sizeof(void*))    /* 포인터 크기는 64비트에서 8바이트 */
 #define PRED_P(bp) (*(void **)(bp))
-#define SUCC_P(bp) (*(void **)((char *)(bp) + WSIZE))
+#define SUCC_P(bp) (*(void **)((char *)(bp) + PTRSIZE))
 
 #define SET_PRED(bp, p) (PRED_P(bp) = (p))
 #define SET_SUCC(bp, p) (SUCC_P(bp) = (p))
 
-/* 가용 블록으로 분할이 가능하려면 최소한 Header, Footer, Pred, Succ 포인터가 모두 필요. (= 2*DSIZE) */
-#define MIN_BLK_SIZE (2 * DSIZE)   // 64bit 기준: 32바이트
+/* 가용 블록으로 분할이 가능하려면 최소한
+ * Header(WSIZE) + Footer(WSIZE) + Pred_Pointer(PTRSIZE) + Succ_Pointer(PTRSIZE)
+ * 이 필요하다. (= 2*WSIZE + 2*PTRSIZE)
+ * 이보다 작은 잔여 공간은 쪼개지지 않고 통째로 할당해버리는 게 맞음. */
+#define MIN_BLK_SIZE (2 * WSIZE + 2 * PTRSIZE)   // 64bit 기준: 32바이트
 
 /* static 전역 포인터들 */
-static void *heap_listp;                       /* Implicit 순회를 위한 포인터 */
+static void *heap_listp;                    /* Implicit 순회를 위한 포인터 */
 static void *segregated_lists[NUM_CLASSES]; /* SEGREGATED: 사이즈 클래스별 가용 리스트의 시작점을 담는 배열 */
 
 /* 함수 프로토타입 */
@@ -100,7 +104,7 @@ static int get_list_index(size_t size);
  */
 static int get_list_index(size_t size) {
     int index = 0;
-    size_t current_max = 32;
+    size_t current_max = MIN_BLK_SIZE;
     
     while (index < NUM_CLASSES - 1) {
         if (size <= current_max) {
@@ -151,6 +155,9 @@ static void remove_block(void *bp) {
 static int binary_case(size_t size) {
     if (size == 112) {
         return 128;
+    } 
+    else if (size == 448) {
+        return 512;
     }
     return size;
 }
