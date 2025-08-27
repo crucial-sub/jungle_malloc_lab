@@ -314,8 +314,7 @@ static void place(void *bp, size_t asize) {
 
 
 /*
- * mm_realloc - 64비트 기준 최적화 버전
- * - 축소/확장 시 가능한 경우 블록을 재사용
+ * mm_realloc - 이전/다음 가용 블록을 모두 확인하여 최적화
  */
 void *mm_realloc(void *bp, size_t size)
 {
@@ -327,9 +326,7 @@ void *mm_realloc(void *bp, size_t size)
         return NULL;
     }
 
-    size_t old_csize = GET_SIZE(HDRP(bp));
     size_t new_asize;
-
     // 새로 필요한 블록 크기 계산 (16바이트 정렬)
     if (size <= DSIZE) {
         new_asize = MIN_BLK_SIZE;
@@ -337,41 +334,88 @@ void *mm_realloc(void *bp, size_t size)
         new_asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
     }
 
-    /* [축소] 요청 크기가 더 작거나 같을 경우 */
+    size_t old_csize = GET_SIZE(HDRP(bp));
+
+    /* [축소] 요청 크기가 더 작거나 같을 경우, 제자리에서 처리 */
     if (new_asize <= old_csize) {
         size_t rem = old_csize - new_asize;
-        if (rem >= MIN_BLK_SIZE) {
+        if (rem >= MIN_BLK_SIZE) { // 남는 공간이 최소 블록 크기 이상이면 분할
             PUT(HDRP(bp), PACK(new_asize, 1));
             PUT(FTRP(bp), PACK(new_asize, 1));
             void *rbp = NEXT_BLKP(bp);
             PUT(HDRP(rbp), PACK(rem, 0));
             PUT(FTRP(rbp), PACK(rem, 0));
-            coalesce(rbp);
-        } else {
+            coalesce(rbp); // 분할된 블록을 가용 리스트에 추가
         }
+        // 남는 공간이 작으면 분할하지 않고 그대로 둠 (내부 단편화)
         return bp;
     }
 
-    /* [확장] 요청 크기가 더 클 경우 */
+    /* [확장] 요청 크기가 더 클 경우, 주변 블록 확인 */
+    void *prev_bp = PREV_BLKP(bp);
     void *next_bp = NEXT_BLKP(bp);
+    size_t prev_alloc = GET_ALLOC(HDRP(prev_bp));
     size_t next_alloc = GET_ALLOC(HDRP(next_bp));
-    size_t next_size = GET_SIZE(HDRP(next_bp));
-    size_t total_size = old_csize + next_size;
+    size_t current_size = old_csize;
 
-    if (!next_alloc && total_size >= new_asize) {
+    // Case 1: 다음 블록만 가용하고, 합친 크기가 충분할 때
+    if (prev_alloc && !next_alloc && (current_size + GET_SIZE(HDRP(next_bp))) >= new_asize) {
+        current_size += GET_SIZE(HDRP(next_bp));
         remove_block(next_bp);
-        
-        size_t rem = total_size - new_asize;
+        PUT(HDRP(bp), PACK(current_size, 1));
+        PUT(FTRP(bp), PACK(current_size, 1));
+        // 확장 후 남는 공간이 있으면 분할 (place 로직과 유사)
+        size_t rem = current_size - new_asize;
         if (rem >= MIN_BLK_SIZE) {
             PUT(HDRP(bp), PACK(new_asize, 1));
             PUT(FTRP(bp), PACK(new_asize, 1));
-            void *rbp = NEXT_BLKP(bp);
+            void* rbp = NEXT_BLKP(bp);
             PUT(HDRP(rbp), PACK(rem, 0));
             PUT(FTRP(rbp), PACK(rem, 0));
             insert_block(rbp);
-        } else {
-            PUT(HDRP(bp), PACK(total_size, 1));
-            PUT(FTRP(bp), PACK(total_size, 1));
+        }
+        return bp;
+    }
+    // Case 2: 이전 블록만 가용하고, 합친 크기가 충분할 때
+    else if (!prev_alloc && next_alloc && (current_size + GET_SIZE(HDRP(prev_bp))) >= new_asize) {
+        current_size += GET_SIZE(HDRP(prev_bp));
+        remove_block(prev_bp);
+        // 데이터를 이전 블록 시작 위치로 이동 (memmove 사용!)
+        memmove(prev_bp, bp, old_csize - DSIZE);
+        PUT(HDRP(prev_bp), PACK(current_size, 1));
+        PUT(FTRP(prev_bp), PACK(current_size, 1));
+        bp = prev_bp;
+        // 확장 후 남는 공간이 있으면 분할
+        size_t rem = current_size - new_asize;
+        if (rem >= MIN_BLK_SIZE) {
+            PUT(HDRP(bp), PACK(new_asize, 1));
+            PUT(FTRP(bp), PACK(new_asize, 1));
+            void* rbp = NEXT_BLKP(bp);
+            PUT(HDRP(rbp), PACK(rem, 0));
+            PUT(FTRP(rbp), PACK(rem, 0));
+            insert_block(rbp);
+        }
+        return bp;
+    }
+    // Case 3: 이전과 다음 블록이 모두 가용하고, 합친 크기가 충분할 때
+    else if (!prev_alloc && !next_alloc && (current_size + GET_SIZE(HDRP(prev_bp)) + GET_SIZE(HDRP(next_bp))) >= new_asize) {
+        current_size += GET_SIZE(HDRP(prev_bp)) + GET_SIZE(HDRP(next_bp));
+        remove_block(prev_bp);
+        remove_block(next_bp);
+        // 데이터를 이전 블록 시작 위치로 이동
+        memmove(prev_bp, bp, old_csize - DSIZE);
+        PUT(HDRP(prev_bp), PACK(current_size, 1));
+        PUT(FTRP(prev_bp), PACK(current_size, 1));
+        bp = prev_bp;
+        // 확장 후 남는 공간이 있으면 분할
+        size_t rem = current_size - new_asize;
+        if (rem >= MIN_BLK_SIZE) {
+            PUT(HDRP(bp), PACK(new_asize, 1));
+            PUT(FTRP(bp), PACK(new_asize, 1));
+            void* rbp = NEXT_BLKP(bp);
+            PUT(HDRP(rbp), PACK(rem, 0));
+            PUT(FTRP(rbp), PACK(rem, 0));
+            insert_block(rbp);
         }
         return bp;
     }
@@ -381,6 +425,7 @@ void *mm_realloc(void *bp, size_t size)
     if (new_bp == NULL) {
         return NULL;
     }
+    // payload 크기만큼만 복사
     size_t copySize = old_csize - DSIZE;
     if (size < copySize) {
         copySize = size;
