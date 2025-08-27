@@ -1,18 +1,3 @@
-/*
- * -----------------------------------------------------------------------------
- * [설계 개요 — Segregated Free List 버전 (64-bit 기준)]
- * - 블록 구조: Explicit list와 동일 [header: 8B | payload ... | footer: 8B]
- * - 정렬: 16바이트(DSIZE) 정렬 유지
- * - 가용 리스트 관리:
- * - 사이즈 클래스별로 분리된 여러 개의 가용 리스트(Segregated Lists)를 운영.
- * - 각 리스트는 해당 사이즈 클래스에 속하는 가용 블록들만 LIFO 방식으로 연결.
- * - 탐색(find_fit):
- * - 요청된 크기에 맞는 사이즈 클래스 리스트부터 탐색 시작.
- * - 적합한 블록을 찾지 못하면, 더 큰 사이즈 클래스의 리스트를 순차적으로 탐색.
- * - 나머지 로직(place, coalesce 등)은 explicit list의 원칙을 따르되,
- * 블록을 추가/제거할 때 올바른 사이즈 클래스 리스트를 찾아가도록 수정.
- * -----------------------------------------------------------------------------
- */
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -98,7 +83,6 @@ static void insert_block(void *bp);
 static void remove_block(void *bp);
 static int get_list_index(size_t size);
 
-
 /*
  * [segregated helper] 주어진 사이즈에 맞는 사이즈 클래스의 인덱스를 반환
  */
@@ -137,19 +121,17 @@ static void insert_block(void *bp) {
  */
 static void remove_block(void *bp) {
     int index = get_list_index(GET_SIZE(HDRP(bp)));
-
     void *prev = PRED_P(bp);
     void *next = SUCC_P(bp);
 
-    if (prev) {
-        SET_SUCC(prev, next);
-    } else {
-        segregated_lists[index] = next;
-    }
+    if (prev) SET_SUCC(prev, next);
+    else      segregated_lists[index] = next;
 
-    if (next) {
-        SET_PRED(next, prev);
-    }
+    if (next) SET_PRED(next, prev);
+
+    // 자기 포인터 초기화(디버그/안정성)
+    SET_PRED(bp, NULL);
+    SET_SUCC(bp, NULL);
 }
 
 static int binary_case(size_t size) {
@@ -161,7 +143,6 @@ static int binary_case(size_t size) {
     }
     return size;
 }
-
 
 /*
  * mm_init - 힙과 segregated lists를 초기화
@@ -180,7 +161,7 @@ int mm_init(void) {
     PUT(heap_listp + (3 * WSIZE), PACK(0, 1));
     heap_listp += (2 * WSIZE);
 
-    if (extend_heap(CHUNKSIZE / WSIZE) == NULL)
+    if (extend_heap((CHUNKSIZE+WSIZE) / WSIZE) == NULL)
         return -1;
     return 0;
 }
@@ -234,7 +215,6 @@ void *mm_malloc(size_t size) {
     return bp;
 }
 
-
 /*
  * mm_free: 블록을 해제하고, coalesce를 통해 가용 리스트에 다시 추가
  */
@@ -246,57 +226,70 @@ void mm_free(void *bp) {
 }
 
 /*
- * coalesce: 주변 블록과 병합하고, 최종 가용 블록을 리스트에 추가
+ * coalesce: 주변 블록과 병합하고, 최종 가용 블록을 리스트에 추가 (개선된 버전)
  */
-static void *coalesce(void *bp) {
+static void *coalesce(void *bp)
+{
     size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
     size_t size = GET_SIZE(HDRP(bp));
 
-    if (!next_alloc) {
-        remove_block(NEXT_BLKP(bp));
-    }
-    if (!prev_alloc) {
-        remove_block(PREV_BLKP(bp));
-    }
-
-    if (prev_alloc && !next_alloc) {
-        size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
-        PUT(HDRP(bp), PACK(size, 0));
-        PUT(FTRP(bp), PACK(size, 0));
-    } else if (!prev_alloc && next_alloc) {
-        size += GET_SIZE(HDRP(PREV_BLKP(bp)));
-        bp = PREV_BLKP(bp);
-        PUT(HDRP(bp), PACK(size, 0));
-        PUT(FTRP(bp), PACK(size, 0));
-    } else if (!prev_alloc && !next_alloc) {
-        size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(HDRP(NEXT_BLKP(bp)));
-        bp = PREV_BLKP(bp);
+    if (prev_alloc && !next_alloc) {           /* Case 2: 다음 블록과 병합 */
+        void *next_bp = NEXT_BLKP(bp);
+        remove_block(next_bp);
+        size += GET_SIZE(HDRP(next_bp));
         PUT(HDRP(bp), PACK(size, 0));
         PUT(FTRP(bp), PACK(size, 0));
     }
+    else if (!prev_alloc && next_alloc) {      /* Case 3: 이전 블록과 병합 */
+        void *prev_bp = PREV_BLKP(bp);
+        remove_block(prev_bp);
+        size += GET_SIZE(HDRP(prev_bp));
+        bp = prev_bp;
+        PUT(HDRP(bp), PACK(size, 0));
+        PUT(FTRP(bp), PACK(size, 0));
+    }
+    else if (!prev_alloc && !next_alloc) {     /* Case 4: 양쪽 블록과 병합 */
+        void *prev_bp = PREV_BLKP(bp);
+        void *next_bp = NEXT_BLKP(bp);
+        remove_block(prev_bp);
+        remove_block(next_bp);
+        size += GET_SIZE(HDRP(prev_bp)) + GET_SIZE(HDRP(next_bp));
+        bp = prev_bp;
+        PUT(HDRP(bp), PACK(size, 0));
+        PUT(FTRP(bp), PACK(size, 0));
+    }
+    /* Case 1: 아무것도 안 함 */
 
     insert_block(bp);
     return bp;
 }
 
 /*
- * find_fit: Segregated list를 사용하여 적절한 가용 블록을 탐색 (First-Fit)
+ * find_fit: Segregated list 전체에서 asize 이상 중 "가장 근접한" 블록 선택 (Global Best-Fit)
+ * - 요청 bin부터 시작해 상위 bin까지 전역 탐색
+ * - coalescing 패턴에서 방금 병합된 "딱 맞는" 블록을 놓치지 않게 함
  */
 static void *find_fit(size_t asize) {
-    int index = get_list_index(asize);
-    for (int i = index; i < NUM_CLASSES; i++) {
+    void *best = NULL;
+    size_t best_sz = (size_t)-1;
+
+    int start = get_list_index(asize);
+    for (int i = start; i < NUM_CLASSES; i++) {
         for (void *bp = segregated_lists[i]; bp != NULL; bp = SUCC_P(bp)) {
-            if (GET_SIZE(HDRP(bp)) >= asize) {
-                return bp;
+            size_t sz = GET_SIZE(HDRP(bp));
+            if (sz >= asize && sz < best_sz) {
+                best = bp;
+                best_sz = sz;
+                if (best_sz == asize) return best; // 완전 일치면 즉시 반환
             }
         }
     }
-    return NULL;
+    return best;
 }
 
 /*
- * place: 찾은 가용 블록에 요청한 크기만큼 할당하고, 남는 부분은 분할
+ * place: 찾은 가용 블록에 요청한 크기만큼 할당하고, 남는 부분은 분할 (수정된 버전)
  */
 static void place(void *bp, size_t asize) {
     size_t csize = GET_SIZE(HDRP(bp));
@@ -312,16 +305,20 @@ static void place(void *bp, size_t asize) {
         PUT(HDRP(rbp), PACK(rem, 0));
         PUT(FTRP(rbp), PACK(rem, 0));
         
-        insert_block(rbp);
+        // insert_block 대신 coalesce를 호출하여, rbp 바로 다음 블록이
+        // 가용 상태일 경우 즉시 병합하도록 함.
+        coalesce(rbp);
     } else {
         PUT(HDRP(bp), PACK(csize, 1));
         PUT(FTRP(bp), PACK(csize, 1));
     }
 }
 
-
 /*
  * mm_realloc - 이전/다음 가용 블록을 모두 확인하여 최적화
+ */
+/*
+ * mm_realloc - '과잉 투자' 전략이 추가된 최종 최적화 버전
  */
 void *mm_realloc(void *bp, size_t size)
 {
@@ -334,7 +331,6 @@ void *mm_realloc(void *bp, size_t size)
     }
 
     size_t new_asize;
-    // 새로 필요한 블록 크기 계산 (16바이트 정렬)
     if (size <= DSIZE) {
         new_asize = MIN_BLK_SIZE;
     } else {
@@ -343,36 +339,27 @@ void *mm_realloc(void *bp, size_t size)
 
     size_t old_csize = GET_SIZE(HDRP(bp));
 
-    /* [축소] 요청 크기가 더 작거나 같을 경우, 제자리에서 처리 */
+    /* [축소] 요청 크기가 더 작거나 같을 경우 */
     if (new_asize <= old_csize) {
         size_t rem = old_csize - new_asize;
-        if (rem >= MIN_BLK_SIZE) { // 남는 공간이 최소 블록 크기 이상이면 분할
+        if (rem >= MIN_BLK_SIZE) {
             PUT(HDRP(bp), PACK(new_asize, 1));
             PUT(FTRP(bp), PACK(new_asize, 1));
             void *rbp = NEXT_BLKP(bp);
             PUT(HDRP(rbp), PACK(rem, 0));
             PUT(FTRP(rbp), PACK(rem, 0));
-            coalesce(rbp); // 분할된 블록을 가용 리스트에 추가
+            coalesce(rbp);
         }
-        // 남는 공간이 작으면 분할하지 않고 그대로 둠 (내부 단편화)
         return bp;
     }
 
-    /* [확장] 요청 크기가 더 클 경우, 주변 블록 확인 */
-    void *prev_bp = PREV_BLKP(bp);
+    /* [확장] 바로 다음 블록이 가용하고, 합친 크기가 충분한 경우 (In-place 최적화) */
     void *next_bp = NEXT_BLKP(bp);
-    size_t prev_alloc = GET_ALLOC(HDRP(prev_bp));
-    size_t next_alloc = GET_ALLOC(HDRP(next_bp));
-    size_t current_size = old_csize;
-
-    // Case 1: 다음 블록만 가용하고, 합친 크기가 충분할 때
-    if (prev_alloc && !next_alloc && (current_size + GET_SIZE(HDRP(next_bp))) >= new_asize) {
-        current_size += GET_SIZE(HDRP(next_bp));
+    if (!GET_ALLOC(HDRP(next_bp)) && (old_csize + GET_SIZE(HDRP(next_bp))) >= new_asize) {
+        size_t total_size = old_csize + GET_SIZE(HDRP(next_bp));
         remove_block(next_bp);
-        PUT(HDRP(bp), PACK(current_size, 1));
-        PUT(FTRP(bp), PACK(current_size, 1));
-        // 확장 후 남는 공간이 있으면 분할 (place 로직과 유사)
-        size_t rem = current_size - new_asize;
+        
+        size_t rem = total_size - new_asize;
         if (rem >= MIN_BLK_SIZE) {
             PUT(HDRP(bp), PACK(new_asize, 1));
             PUT(FTRP(bp), PACK(new_asize, 1));
@@ -380,63 +367,29 @@ void *mm_realloc(void *bp, size_t size)
             PUT(HDRP(rbp), PACK(rem, 0));
             PUT(FTRP(rbp), PACK(rem, 0));
             insert_block(rbp);
-        }
-        return bp;
-    }
-    // Case 2: 이전 블록만 가용하고, 합친 크기가 충분할 때
-    else if (!prev_alloc && next_alloc && (current_size + GET_SIZE(HDRP(prev_bp))) >= new_asize) {
-        current_size += GET_SIZE(HDRP(prev_bp));
-        remove_block(prev_bp);
-        // 데이터를 이전 블록 시작 위치로 이동 (memmove 사용!)
-        memmove(prev_bp, bp, old_csize - DSIZE);
-        PUT(HDRP(prev_bp), PACK(current_size, 1));
-        PUT(FTRP(prev_bp), PACK(current_size, 1));
-        bp = prev_bp;
-        // 확장 후 남는 공간이 있으면 분할
-        size_t rem = current_size - new_asize;
-        if (rem >= MIN_BLK_SIZE) {
-            PUT(HDRP(bp), PACK(new_asize, 1));
-            PUT(FTRP(bp), PACK(new_asize, 1));
-            void* rbp = NEXT_BLKP(bp);
-            PUT(HDRP(rbp), PACK(rem, 0));
-            PUT(FTRP(rbp), PACK(rem, 0));
-            insert_block(rbp);
-        }
-        return bp;
-    }
-    // Case 3: 이전과 다음 블록이 모두 가용하고, 합친 크기가 충분할 때
-    else if (!prev_alloc && !next_alloc && (current_size + GET_SIZE(HDRP(prev_bp)) + GET_SIZE(HDRP(next_bp))) >= new_asize) {
-        current_size += GET_SIZE(HDRP(prev_bp)) + GET_SIZE(HDRP(next_bp));
-        remove_block(prev_bp);
-        remove_block(next_bp);
-        // 데이터를 이전 블록 시작 위치로 이동
-        memmove(prev_bp, bp, old_csize - DSIZE);
-        PUT(HDRP(prev_bp), PACK(current_size, 1));
-        PUT(FTRP(prev_bp), PACK(current_size, 1));
-        bp = prev_bp;
-        // 확장 후 남는 공간이 있으면 분할
-        size_t rem = current_size - new_asize;
-        if (rem >= MIN_BLK_SIZE) {
-            PUT(HDRP(bp), PACK(new_asize, 1));
-            PUT(FTRP(bp), PACK(new_asize, 1));
-            void* rbp = NEXT_BLKP(bp);
-            PUT(HDRP(rbp), PACK(rem, 0));
-            PUT(FTRP(rbp), PACK(rem, 0));
-            insert_block(rbp);
+        } else {
+            PUT(HDRP(bp), PACK(total_size, 1));
+            PUT(FTRP(bp), PACK(total_size, 1));
         }
         return bp;
     }
 
-    /* [최후의 수단] 새로 할당 후 복사 */
-    void *new_bp = mm_malloc(size);
+    /* --- 여기가 바로 새로운 전략이 적용되는 부분 --- */
+    /* [최후의 수단] 새로 할당 후 복사 ('과잉 투자' 적용) */
+    
+    // 요청받은 크기보다 더 넉넉하게 (예: 2배) 공간을 요청한다.
+    size_t new_alloc_size = MAX(new_asize, old_csize * 10);
+
+    void *new_bp = mm_malloc(new_alloc_size - DSIZE); // mm_malloc은 페이로드 크기를 인자로 받으므로 DSIZE를 빼준다.
     if (new_bp == NULL) {
-        return NULL;
+        // 만약 너무 큰 공간 요청이 실패하면, 원래 요청했던 크기로 다시 시도한다.
+        if ((new_bp = mm_malloc(size)) == NULL) {
+             return NULL;
+        }
     }
+    
     // payload 크기만큼만 복사
     size_t copySize = old_csize - DSIZE;
-    if (size < copySize) {
-        copySize = size;
-    }
     memcpy(new_bp, bp, copySize);
     mm_free(bp);
     return new_bp;
